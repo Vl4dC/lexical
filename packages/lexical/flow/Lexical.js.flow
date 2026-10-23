@@ -1885,6 +1885,15 @@ declare export function $insertNodeToNearestRootAtCaret<T extends LexicalNode>(
 ): NodeCaret<CaretDirection>;
 
 /**
+ * LexicalWarning
+ */
+declare export class LexicalWarning extends Error {
+  readonly code: string;
+  readonly data?: unknown;
+  constructor(code: string, message: string, data?: unknown): void;
+}
+
+/**
  * LexicalUpdateTags
  */
 declare export var COLLABORATION_TAG: 'collaboration';
@@ -1894,6 +1903,7 @@ declare export var HISTORY_MERGE_TAG: 'history-merge';
 declare export var HISTORY_PUSH_TAG: 'history-push';
 declare export var PASTE_TAG: 'paste';
 declare export var SKIP_COLLAB_TAG: 'skip-collab';
+declare export var DEFER_COMPOSITION_MERGE_TAG: 'defer-composition-merge';
 declare export var SKIP_DOM_SELECTION_TAG: 'skip-dom-selection';
 declare export var SKIP_SCROLL_INTO_VIEW_TAG: 'skip-scroll-into-view';
 export type UpdateTag =
@@ -1904,6 +1914,7 @@ export type UpdateTag =
   | typeof HISTORY_PUSH_TAG
   | typeof PASTE_TAG
   | typeof SKIP_COLLAB_TAG
+  | typeof DEFER_COMPOSITION_MERGE_TAG
   | typeof SKIP_DOM_SELECTION_TAG
   | typeof SKIP_SCROLL_INTO_VIEW_TAG
   | string;
