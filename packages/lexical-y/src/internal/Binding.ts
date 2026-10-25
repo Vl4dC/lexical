@@ -71,8 +71,14 @@ import {
 
 import {$appendAll, ARGUMENTS_CHUNK, pushAll, spliceAll} from './Arrays';
 import {type ClientIDRange, constrainClientID} from './ClientID';
-import {DEFAULT_ROOT_NAME, LEGACY_ROOTS} from './constants';
+import {
+  BASE_LAYOUT_VERSION,
+  DEFAULT_ROOT_NAME,
+  LEGACY_ROOTS,
+  MOVES_LAYOUT_VERSION,
+} from './constants';
 import {Hidden, shownLength} from './Hidden';
+import {type Shown, stepZone, viewZone} from './Moves';
 import {$storedIdNow, $touchChanged, Reader} from './Read';
 import {
   $groupFields,
@@ -92,6 +98,7 @@ import {
   stableStringify,
   type StorageKind,
   storageKindOf,
+  UNIT_KEY,
   withPins,
 } from './Schema';
 import {$checkWrite, checkContainer} from './SelfCheck';
@@ -99,9 +106,11 @@ import {$unstorableSlotHosts} from './Slots';
 import {
   type CS,
   isEndItem,
+  lineStart,
   nameOf,
-  prevLiveEnd,
+  nextZoneEnd,
   Roles,
+  startItemAfter,
   State,
   typeOf,
 } from './State';
@@ -431,6 +440,7 @@ export class YBinding {
   private busy = 0;
   private flushingWarnings = false;
   private readonly afterAllTransactions = (): void => this.flushWarnings();
+  private readonly afterTransactionCleanup = (): void => this.state.nextEpoch();
 
   /** The bound editor. */
   get editor(): LexicalEditor {
@@ -481,6 +491,8 @@ export class YBinding {
         tr.origin !== this.followUpOrigin
           ? this.getCursor()
           : null;
+      // Cached move ownership is checked again (see State#epoch).
+      this.state.nextEpoch();
     };
   }
 
@@ -542,6 +554,12 @@ export class YBinding {
     this._doc.on('afterTransaction', this.afterTransaction);
     this.disposers.push(() =>
       this._doc.off('afterTransaction', this.afterTransaction),
+    );
+    // Yjs merges items (an anchor of a move record) when it cleans up.
+    this.state.nextEpoch();
+    this._doc.on('afterTransactionCleanup', this.afterTransactionCleanup);
+    this.disposers.push(() =>
+      this._doc.off('afterTransactionCleanup', this.afterTransactionCleanup),
     );
     // Warnings found while Yjs applies a change are passed on once it has
     // been applied in full (see flushWarnings).
@@ -798,7 +816,7 @@ export class YBinding {
     tr: Transaction,
     editorState: EditorState,
   ): void {
-    root.setAttr(LAYOUT_PREFIX + LAYOUT_VERSION, true);
+    root.setAttr(LAYOUT_PREFIX + BASE_LAYOUT_VERSION, true);
     // Every element type of the initial content (into `root`, which may be
     // a scratch document's: this._pins is filled when the real one is read).
     this.recordPins(root, editorState, null, new Map());
@@ -874,7 +892,7 @@ export class YBinding {
     }
     return write(
       initClientID(
-        LAYOUT_VERSION + '\u0000' + 'r:' + rootName + '\u0000' + content,
+        BASE_LAYOUT_VERSION + '\u0000' + 'r:' + rootName + '\u0000' + content,
         this.clientIDRange(),
       ),
     );
@@ -1048,6 +1066,11 @@ export class YBinding {
       );
       this.setStatus('readonly');
     } else {
+      if (this._status === 'active') {
+        // Still a layout this client reads and writes (the first move record
+        // adds 2 to the record): nothing to read again.
+        return;
+      }
       this.setStatus('active');
     }
     this.readAll(cursor, kept);
@@ -1402,6 +1425,17 @@ export class YBinding {
           this.loadPins();
         }
         return;
+      }
+      if (
+        keys.has(UNIT_KEY) &&
+        type._item !== null &&
+        type._item.parentSub === null &&
+        type._item.parent instanceof YNode &&
+        state.containers.has(type._item.parent)
+      ) {
+        // A block lifted in place (or no longer): its container's units
+        // changed, as when an item is inserted there.
+        add(type._item);
       }
       const isOurs =
         state.keyByY.has(type) ||
@@ -2028,6 +2062,7 @@ export class YBinding {
       });
     }
     const state = this.state;
+    const reread: CS[] = [];
     editorState.read(() => {
       const roles = new Roles(state);
       const plan = Writer.$plan(
@@ -2039,6 +2074,9 @@ export class YBinding {
       const movedNodes = editorState._movedNodes;
       plan.moved =
         movedNodes === null ? null : movedNodes.get(prevEditorState._nodeMap);
+      // Follow-up writes of a remote change run on every client: they leave
+      // move records where they are (see Writer.$normalizeRecords).
+      plan.followUp = followUp;
       if (
         plan.structural.size === 0 &&
         plan.inline.size === 0 &&
@@ -2070,6 +2108,12 @@ export class YBinding {
           writer = new Writer(state, roles, tr, prevEditorState, plan);
           writer.followUp = followUp;
           writer.$run();
+          if (writer.wroteRecord || writer.wroteUnitMark) {
+            // In the same transaction as the first move record or lifted
+            // block: clients that only read layout 1 never see one without
+            // the version that tells them they cannot read it.
+            this.recordMovesLayout();
+          }
         }, origin);
         // Kinds of types written for the first time, outside the undo
         // history (undoing the content must not forget how a type is stored).
@@ -2114,6 +2158,9 @@ export class YBinding {
             rewriter.followUp = followUp;
             rewriter.$run();
             this.noteRefused(rewriter, naming);
+            if (rewriter.wroteRecord || rewriter.wroteUnitMark) {
+              this.recordMovesLayout();
+            }
           }, origin);
         } catch (e2) {
           this._editor._onError(
@@ -2216,6 +2263,18 @@ export class YBinding {
           }
         }
       }
+      // A write with move records can change what other units show (a
+      // record it deleted lets another one show): read those containers
+      // again, as a peer would.
+      const zoned = writer as Writer | null;
+      if (zoned !== null && zoned.zonedWrites.size > 0) {
+        const reader = new Reader(state);
+        for (const cs of zoned.zonedWrites) {
+          if (!reader.matchesShared(cs)) {
+            reread.push(cs);
+          }
+        }
+      }
       // While a change made without Lexical's transforms waits for the
       // author's normalization, the editor is compared once that is written
       // (readers already build some of that normalization: adjacent equal
@@ -2231,6 +2290,8 @@ export class YBinding {
         check &&
         writer !== null &&
         this.remoteSeq === seq &&
+        // The editor is about to be corrected by a read (see above).
+        reread.length === 0 &&
         Math.random() < (this.options.selfCheckSample ?? 1)
       ) {
         const problems = $checkWrite(writer);
@@ -2266,6 +2327,14 @@ export class YBinding {
         }
       }
     });
+    if (reread.length > 0) {
+      // Read when the editor is idle, as containers a follow-up changed are
+      // (see runPending): never from this listener.
+      for (const cs of reread) {
+        this.refused.add(cs);
+      }
+      this.pending.add('reread');
+    }
     if (!refresh) {
       if (localKeys.size > 0) {
         for (const key of localKeys) {
@@ -3057,6 +3126,19 @@ export class YBinding {
       : $getNodeByKey(unit.key);
   }
 
+  /**
+   * A move record or a lifted block is being written: record the layout
+   * that has them (`lexical-y:2`), in the same transaction, unless the
+   * document records it already. The record only grows: undo never deletes
+   * it (see isKeptByUndo).
+   */
+  private recordMovesLayout(): void {
+    const key = LAYOUT_PREFIX + MOVES_LAYOUT_VERSION;
+    if (this._root.getAttr(key) !== true) {
+      this._root.setAttr(key, true);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Undo
 
@@ -3066,6 +3148,14 @@ export class YBinding {
    * leave a malformed container).
    */
   private isKeptByUndo(item: Item): boolean {
+    // The layout record only grows.
+    if (
+      item.parent === this._root &&
+      typeof item.parentSub === 'string' &&
+      item.parentSub.startsWith(LAYOUT_PREFIX)
+    ) {
+      return true;
+    }
     // A container this undo also restores elsewhere was moved (deleted and
     // written again): keeping the new copy would duplicate it.
     const moved = (it: Item): boolean =>
@@ -3457,9 +3547,13 @@ export class YBinding {
     offset += $atomsBefore(parent, target);
     const unit = state.unitByKey.get(owner.getKey());
     let start: Item | null;
+    let hidden: Shown | null = this.state.hidden;
+    let parentY: YNode | null = null;
     if (unit !== undefined && unit.end !== null) {
-      const left = prevLiveEnd(unit.end);
-      start = left === null ? unit.cs.y._start : left.right;
+      const {left, zone} = lineStart(this.state, unit.end);
+      parentY = unit.cs.y;
+      start = startItemAfter(this.state.zonesOf(parentY), parentY, left, zone);
+      hidden = this.state.view(parentY, zone);
     } else {
       const cs = state.csByKey.get(owner.getKey());
       if (cs === undefined || cs.kind !== 'i') {
@@ -3476,13 +3570,22 @@ export class YBinding {
           assoc,
         ),
       );
-    // Offsets count what the editor shows (not hidden remote content).
-    const hidden = state.hidden;
+    // Offsets count what the editor shows (not hidden remote content, nor
+    // the content of other zones).
     const unitAt = (it: Item, shown: number) =>
       hidden === null ? shown : hidden.unitAt(it, shown);
     let lastLive: Item | null = null;
     let lastLen = 0;
-    for (let it = start; it !== null; it = it.right) {
+    // With moves, the walk of the line's zone (entering inline ranges).
+    const walk = viewZone(hidden);
+    for (
+      let it = start;
+      it !== null;
+      it =
+        walk === null || parentY === null
+          ? it.right
+          : stepZone(walk, parentY, it, null)
+    ) {
       const len = shownLength(it, hidden);
       if (len === 0) {
         if (isEndItem(it) && !it.deleted) {
@@ -3638,9 +3741,21 @@ export class YBinding {
         diff = 0;
       }
     }
-    const hidden = this.state.hidden;
-    while (item !== null && shownLength(item, hidden) === 0) {
-      item = item.right;
+    const parentY = item === null ? null : (item.parent as YNode);
+    // The zone of the position's item: what its line shows.
+    const seek: Shown | null =
+      item === null || parentY === null
+        ? this.state.hidden
+        : this.state.view(parentY, this.state.zoneOf(item));
+    const seekWalk = viewZone(seek);
+    while (item !== null && shownLength(item, seek) === 0) {
+      if (isEndItem(item) && !item.deleted && !viewForeign(seek, item)) {
+        break;
+      }
+      item =
+        seekWalk === null || parentY === null
+          ? item.right
+          : stepZone(seekWalk, parentY, item, null);
       diff = 0;
     }
     if (item === null) {
@@ -3651,19 +3766,27 @@ export class YBinding {
         ? this.$nearestLinePoint(found)
         : null;
     }
-    // Walk to the unit end; count atoms from the unit start.
-    let end: Item | null = item;
-    while (end !== null && (end.deleted || !isEndItem(end))) {
-      end = end.right;
+    if (parentY === null) {
+      return null;
     }
-    const parentY = item.parent as YNode;
+    // Walk to the unit end; count atoms from the unit start.
+    const end: Item | null =
+      !item.deleted && isEndItem(item)
+        ? item
+        : nextZoneEnd(
+            this.state,
+            item,
+            seekWalk === null ? undefined : seekWalk.zone,
+          );
     const unit = end === null ? undefined : this.state.unitByEnd.get(end);
     let ownerKey: NodeKey | undefined;
     let start: Item | null;
+    let hidden: Shown | null = seek;
     if (unit !== undefined && unit.key !== null && unit.kind === 'line') {
       ownerKey = unit.key;
-      const left = prevLiveEnd(end);
-      start = left === null ? parentY._start : left.right;
+      const {left, zone} = lineStart(this.state, end!);
+      start = startItemAfter(this.state.zonesOf(parentY), parentY, left, zone);
+      hidden = this.state.view(parentY, zone);
     } else {
       const cs = this.state.containers.get(parentY);
       if (cs === undefined || cs.kind !== 'i') {
@@ -3678,7 +3801,12 @@ export class YBinding {
       start = parentY._start;
     }
     let offset = 0;
-    for (let it = start; it !== null && it !== item; it = it.right) {
+    const walk = viewZone(hidden);
+    for (
+      let it = start;
+      it !== null && it !== item;
+      it = walk === null ? it.right : stepZone(walk, parentY, it, null)
+    ) {
       offset += shownLength(it, hidden);
     }
     offset +=
@@ -4304,4 +4432,9 @@ function $splitLineBreaks(node: TextNode): void {
       }
     }
   }
+}
+
+function viewForeign(view: Shown | null, item: Item): boolean {
+  const zv = viewZone(view);
+  return zv !== null && zv.foreign(item);
 }
