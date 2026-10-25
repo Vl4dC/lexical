@@ -20,6 +20,7 @@ import {
   createEditor,
   type EditorState,
   ElementNode,
+  type LexicalEditor,
   type LexicalNode,
   type NodeKey,
   type SerializedLexicalNode,
@@ -36,8 +37,10 @@ import {
   getContainerGroupSpec,
   INLINE_PREFIX,
   isOwnedTextKey,
+  isSetStateConfig,
   MARKER,
   RUN_END,
+  SET_MEMBER_SEPARATOR,
   stableStringify,
   STATE_PREFIX,
   TEXT_FORMAT_PREFIX,
@@ -417,6 +420,33 @@ function firstDifference(a: unknown, b: unknown, path: string): string | null {
 }
 
 /**
+ * Make the set-valued StateConfigs known to `from` (registered by an
+ * extension, or used there) known to `to` too, so that `to` joins the
+ * per-member entries it reads into sets the way `from` does. A StateConfig
+ * whose key contains the member separator is shared too: the reader keeps
+ * an entry of that name as an ordinary key only when it knows a StateConfig
+ * for it (see joinSetMembers).
+ */
+function shareSetStateConfigs(from: LexicalEditor, to: LexicalEditor): void {
+  for (const [type, info] of from._nodes) {
+    const target = to._nodes.get(type);
+    if (target === undefined) {
+      continue;
+    }
+    const {sharedConfigMap} = target.sharedNodeState;
+    for (const stateConfig of info.sharedNodeState.sharedConfigMap.values()) {
+      if (
+        (isSetStateConfig(stateConfig) ||
+          stateConfig.key.includes(SET_MEMBER_SEPARATOR)) &&
+        !sharedConfigMap.has(stateConfig.key)
+      ) {
+        sharedConfigMap.set(stateConfig.key, stateConfig);
+      }
+    }
+  }
+}
+
+/**
  * Development self-check of a whole container: a fresh reader (a new editor
  * with the same nodes) reads the container's shared content, and the result
  * must equal the editor's container (node types, fields, NodeState, list
@@ -454,6 +484,7 @@ export function checkContainer(
       throw e;
     },
   });
+  shareSetStateConfigs(state.editor, fresh);
   let read: Attrs | null = null;
   let problem: string | null = null;
   try {
